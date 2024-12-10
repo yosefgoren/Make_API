@@ -1,9 +1,38 @@
+#!/home/yogo/env/bin/python3
 from makeapi import *
+import click
 
-def gcc_cmd(rule: Rule) -> str:
-    sources = " ".join([dep.get_id() for dep in rule.depends_on])
-    return f"gcc {sources} -o {rule.target.get_id()}"
+rules: list[Rule] = []
 
-target = DynamicFileNode("poc-example-exec")
-rule = ShellRule(target, [StaticFileNode("poc-example.c")], gcc_cmd)
-BuildSystem([rule]).build(target)
+src_names = [
+    "poc-example",
+    "example-dep"
+]
+objs = [DynamicFileNode(f"{name}.o") for name in src_names]
+rules += [CompileRule(o, [StaticFileNode(f"{name}.c")], flags=["-c"]) for o, name in zip(objs, src_names)]
+
+tgt = DynamicFileNode("poc-example-exec")
+rules.append(CompileRule(tgt, objs))
+bs = BuildSystem(rules)
+
+@click.group()
+def cli():
+    pass
+
+@cli.command("build")
+def build():
+    print(f"Building target...")
+    bs.build(tgt)
+
+@cli.command("clean")
+def clean():
+    print(f"Cleaning target...")
+    bs.clean(tgt)
+
+@cli.command("dag")
+def dag():
+    print(f"Printing DAG...")
+    bs.dag(tgt)
+
+if __name__ == "__main__":
+    cli()
