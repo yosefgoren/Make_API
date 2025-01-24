@@ -2,6 +2,45 @@ from typing import Callable
 from abc import ABC, abstractmethod
 import os
 from dataclasses import dataclass
+from enum import Enum
+import json
+import atexit
+import shutil
+import filecmp
+import hashlib
+
+DATABASE_FILENAME = "makeapi_database.json"
+class Database:
+    """
+    This database is internal to the implementation of make API, and i used to store persistant information
+    regarding the states of the objects managed by the build system
+    """
+    def __init__(self):
+        if not os.path.exists(DATABASE_FILENAME):
+            self.data = dict()
+        else:
+            self.data = json.load(open(DATABASE_FILENAME, 'r'))
+        atexit.register(self.sync) # This ensures sync will be called if the program is interrupted or exits normally
+
+    def sync(self) -> None:
+        json.dump(self.data, open(DATABASE_FILENAME, 'w'), indent=4)
+
+    def clean(self) -> None:
+        if os.path.exists(DATABASE_FILENAME):
+            os.remove(DATABASE_FILENAME)
+        atexit.unregister(self.sync)
+
+DATABASE: None | Database = None
+def get_db() -> Database:
+    global DATABASE
+    if DATABASE is None:
+        DATABASE = Database()
+    return DATABASE
+
+class BuildState(Enum):
+    CLEAN = "clean"
+    DIRTY = "dirty" 
+    BUILT = "built" 
 
 class Node(ABC):
     @abstractmethod
@@ -60,8 +99,81 @@ class FileNode(Node):
         except FileNotFoundError:
             return None
 
+@dataclass
+class FileModificationNode(DynamicNode):
+    """
+    This node does not represent the file itself,
+    instead it represents a specific modification made to a file.
 
-class DynamicFileNode(DynamicNode, FileNode):
+    One modification to the file may invalidate a previous modification to it.
+    """
+
+    modified_file: FileNode
+    modification_key: str
+
+    def get_id(self):
+        return f"{self.modified_file.get_id()}_{self.modification_key}"
+
+    def get_time(self) -> float | None:
+        path: str | None = self.get_clone_file_path()
+        if path is None:
+            return None
+        try:
+            return os.path.getmtime(path)
+        except FileNotFoundError:
+            return None
+
+    def _get_clone_paths(self) -> dict[str, str]:
+        """
+        Returns a reference to the clone paths dictionary from the persistant global database.
+        This is used to store paths of clones of files which are made before modifying them.
+        """
+        #TODO: verify 'clone_paths' is synced back to database with current code.
+        db = get_db().data
+        if "clone_paths" not in db.keys():
+            db["clone_paths"] = dict()
+        return db["clone_paths"] # typing: ignore
+
+    def clean(self) -> None:
+        path: str | None = self.get_clone_file_path()
+
+        # Verify not requested to clean a file which does not exist:
+        if path is None:
+            # print(f"Warning: Requested to clean the modification to '{self.modified_file.path}' but a clone file was not found.")
+            return
+        
+        shutil.move(path, self.modified_file.path)
+        
+        # Cleanup in the database:
+        clone_paths: dict[str, str] = self._get_clone_paths()
+        del clone_paths[self.modified_file.get_id()]
+
+    def create_clone_file(self) -> None:
+        clone_paths: dict[str, str] = self._get_clone_paths()
+        head, tail = os.path.split(self.modified_file.path)
+        new_clone_path = os.path.join(head, f"__clone__{tail}")
+        
+        # Verify not requesting to clone a file which already has a clone:
+        assert self.modified_file.get_id() not in clone_paths.keys()
+        if os.path.exists(new_clone_path):
+            print(f"Warning: clone file '{new_clone_path}' already exists. Overriding.")
+
+        shutil.copy(self.modified_file.path, new_clone_path)
+        clone_paths[self.modified_file.get_id()] = new_clone_path
+
+    def get_clone_file_path(self) -> str | None:
+        clone_paths: dict[str, str] = self._get_clone_paths()
+        
+        # The ID used in the 'clone_paths' dict is that of the modified file, not of the modification.
+        # This makes more sense since theoretically - a single modification might modify multiple files, and different modifications may target the same file.
+        
+        if self.modified_file.get_id() not in clone_paths.keys():
+            return None
+        else:
+            assert os.path.exists(clone_paths[self.modified_file.get_id()])
+            return clone_paths[self.modified_file.get_id()]
+
+class CreatedFileNode(DynamicNode, FileNode):
     def clean(self) -> None:
         if os.path.exists(self.path):
             print(f"Removing file: '{self.path}'")
@@ -73,12 +185,8 @@ class StaticFileNode(StaticNode, FileNode):
             return "File not found"
         return None
 
-# @dataclass
-# class JsonEntryNode(DynamicNode):
-#     pass
-
 @dataclass
-class Rule(ABC):
+class Rule(ABC): #TODO: Maybe change implementation of generic rule to not implement 'is_up_to_date' and use current impl in 'CreateRule'
     """
     'Rule' might be a good place to add resource locks when later adding multiprocessing.
     """
@@ -96,6 +204,106 @@ class Rule(ABC):
     def execute(self) -> None:
         pass
 
+class ModifyRule(Rule):
+    """
+    A modify rule builds a dynamic node by making a modification to it from it's clean state.
+    From the perspective of the modify rule, the target node can be in 3 states:
+    1. Clean: This is the base state in which the target will be found after invoking it's 'clean' method.
+    2. Built: This is the state in which the object can be found after being successfuly modified from the clean state.
+    3. Dirty: This is any state other than the clean or built states.
+    
+    When requested to execute, a modify rule will check if the target is built - and if so - do nothing.
+    Otherwise, if the target is dirty - it will clean the target.
+    Next, the modification will be executed.
+    """
+
+    @abstractmethod
+    def _get_build_state(self) -> BuildState:
+        pass
+
+    @abstractmethod
+    def _do_modification(self) -> None:
+        pass
+
+    def execute(self) -> None:
+        state = self._get_build_state()
+        if state is BuildState.BUILT:
+            return
+        if state is BuildState.DIRTY:
+            self.target.clean()
+        self._do_modification()
+
+def get_md5sum(path: str) -> str:
+    return hashlib.md5(open(path, 'rb').read()).hexdigest()
+
+class FileModifyRule(ModifyRule):
+    def __init__(self, target: FileModificationNode, depends_on: list[Node]):
+        super().__init__(target, depends_on)
+        self.target: FileModificationNode = target
+
+    def _get_modified_hashes(self) -> dict[str, str]:
+        db = get_db().data
+        if "modified_hashes" not in db.keys():
+            db["modified_hashes"] = dict()
+        return db["modified_hashes"] # typing: ignore
+
+    def _get_build_state(self) -> BuildState:
+        # If file hash matches the hash stored after modification - the target is built:
+        actual_hash: str = get_md5sum(self.target.modified_file.path)
+        modified_hashes: dict[str, str] = self._get_modified_hashes()
+        
+        if self.target.get_id() not in modified_hashes:
+            return BuildState.CLEAN
+        
+        saved_hash: str = modified_hashes[self.target.get_id()]
+        if actual_hash == saved_hash:
+            return BuildState.BUILT
+
+        # If the clone does not exist or file matches it's clone - we are in the clean state:
+        clone_path: str | None = self.target.get_clone_file_path()
+        if clone_path is None or filecmp.cmp(self.target.modified_file.path, clone_path, shallow=False):
+            return BuildState.CLEAN
+        
+        # Otherwise - we are in the dirty state:
+        return BuildState.DIRTY
+    
+    def _do_modification(self) -> None:
+        # Ensure the target is in a clean state:
+        assert self._get_build_state() == BuildState.CLEAN
+
+        # Create a clone if it does not exist:
+        if self.target.get_clone_file_path() is None:
+            self.target.create_clone_file()
+
+        # Apply the actual modification:
+        self._file_modification()
+
+        # Update the modified hashes database:
+        modified_hashes: dict[str, str] = self._get_modified_hashes()
+        modified_hashes[self.target.get_id()] = get_md5sum(self.target.modified_file.path)
+
+    @abstractmethod
+    def _file_modification(self):
+        """
+        This is the only method that should be overriden by implementations of this class.
+        It should include only the core modification of the target file, excluding any management of the modifications such as cloning or restoring the file.
+        """
+        pass
+
+class ShellFileModifyRule(FileModifyRule):
+    """
+    A rule targeting a modification node, which modifies a file by running a shell command.
+    """
+    def __init__(self, target: FileModificationNode, depends_on: list[Node], modification_cmd: str):
+        """
+        modification_cmd: The shell command line which will apply the wanted modification to the file targeted by the modification.
+        """
+        super().__init__(target, depends_on)
+        self.modification_cmd = modification_cmd
+
+    def _file_modification(self):
+        os.system(self.modification_cmd)
+
 class ShellRule(Rule):
     cmd: str
 
@@ -111,15 +319,15 @@ class ShellRule(Rule):
 class CompileRule(ShellRule):
     def __init__(
             self,
-            target: DynamicFileNode,
+            target: CreatedFileNode,
             source_files: list[FileNode],
-            header_files: list[FileNode] = [],
+            other_dependencies: list[Node] = [],
             compiler: str = "cc",
             flags: list[str] = []
         ):
         super().__init__(
             target,
-            list(source_files+header_files), # For stupid mypy linter
+            list(source_files+other_dependencies), # For stupid mypy linter
             f"{compiler} {' '.join(flags)} {' '.join([n.path for n in source_files])} -o {target.path}"
         )
 
@@ -184,6 +392,8 @@ class BuildSystem:
             if isinstance(node, DynamicNode):
                 node.clean()
         self.traverse_dag(self._all_or_one(target), postorder_action=clean_node)
+
+        get_db().clean()
         
     def dag(self, target: Node | None = None) -> None:
         """Print the nodes/dependencies DAG"""
