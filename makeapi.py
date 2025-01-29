@@ -251,13 +251,10 @@ class FileModifyRule(ModifyRule):
         # If file hash matches the hash stored after modification - the target is built:
         actual_hash: str = get_md5sum(self.target.modified_file.path)
         modified_hashes: dict[str, str] = self._get_modified_hashes()
-        
-        if self.target.get_id() not in modified_hashes:
-            return BuildState.CLEAN
-        
-        saved_hash: str = modified_hashes[self.target.get_id()]
-        if actual_hash == saved_hash:
-            return BuildState.BUILT
+        if self.target.get_id() in modified_hashes.keys():
+            saved_hash: str = modified_hashes[self.target.get_id()]
+            if actual_hash == saved_hash:
+                return BuildState.BUILT
 
         # If the clone does not exist or file matches it's clone - we are in the clean state:
         clone_path: str | None = self.target.get_clone_file_path()
