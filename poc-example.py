@@ -2,7 +2,7 @@
 from makeapi import *
 import click
 
-rules: list[Rule] = []
+rules: list[CreationRule] = []
 
 poc_example_src = StaticFileNode("poc-example.c")
 modified_poc_example_src = FileModificationNode(poc_example_src, "poc-example-mod-1")

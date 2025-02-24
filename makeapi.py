@@ -186,12 +186,20 @@ class StaticFileNode(StaticNode, FileNode):
         return None
 
 @dataclass
-class Rule(ABC): #TODO: Maybe change implementation of generic rule to not implement 'is_up_to_date' and use current impl in 'CreateRule'
+class Rule(ABC):
     """
     'Rule' might be a good place to add resource locks when later adding multiprocessing.
     """
     target: DynamicNode
     depends_on: list[Node]
+
+    # @abstractmethod
+    # def is_up_to_date(self) -> bool:
+    #     pass
+
+    @abstractmethod
+    def execute(self) -> None:
+        pass
 
     def is_up_to_date(self) -> bool:
         res: float | None = self.target.get_time()
@@ -200,11 +208,10 @@ class Rule(ABC): #TODO: Maybe change implementation of generic rule to not imple
         dep_times: list[float | None] = [dep.get_time() for dep in self.depends_on]
         return all([isinstance(t, float) and t < res for t in dep_times])
 
-    @abstractmethod
-    def execute(self) -> None:
-        pass
+class CreationRule(Rule):
+    pass
 
-class ModifyRule(Rule):
+class ModificationRule(Rule):
     """
     A modify rule builds a dynamic node by making a modification to it from it's clean state.
     From the perspective of the modify rule, the target node can be in 3 states:
@@ -236,7 +243,7 @@ class ModifyRule(Rule):
 def get_md5sum(path: str) -> str:
     return hashlib.md5(open(path, 'rb').read()).hexdigest()
 
-class FileModifyRule(ModifyRule):
+class FileModifyRule(ModificationRule):
     def __init__(self, target: FileModificationNode, depends_on: list[Node]):
         super().__init__(target, depends_on)
         self.target: FileModificationNode = target
@@ -301,7 +308,7 @@ class ShellFileModifyRule(FileModifyRule):
     def _file_modification(self):
         os.system(self.modification_cmd)
 
-class ShellRule(Rule):
+class ShellRule(CreationRule):
     cmd: str
 
     def __init__(self, target: DynamicNode, deps: list[Node], cmd: str):
@@ -330,7 +337,7 @@ class CompileRule(ShellRule):
 
 @dataclass
 class BuildSystem:
-    def __init__(self, rules: list[Rule], skip_verification: bool = False):
+    def __init__(self, rules: list[CreationRule], skip_verification: bool = False):
         """
         The set of nodes is infered from the rules.
 
@@ -341,7 +348,7 @@ class BuildSystem:
         This can be disabled by setting 'skip_verification'.
         """
         
-        self.rules: dict[str, Rule] = dict()
+        self.rules: dict[str, CreationRule] = dict()
         self.nodes: dict[str, Node] = dict()
 
         # NOTE: node_requesters is currently dead code, but when adding multiprocessing in the future,
@@ -376,7 +383,7 @@ class BuildSystem:
 
         def execute_rule(node: Node) -> None:
             if isinstance(node, DynamicNode):
-                rule: Rule = self._find_rule(node)
+                rule: CreationRule = self._find_rule(node)
                 if not rule.is_up_to_date():
                     rule.execute()
 
@@ -440,7 +447,7 @@ class BuildSystem:
         # 3.
         self.traverse_dag(list(self.nodes.values()))
 
-    def _find_rule(self, target: DynamicNode) -> Rule:
+    def _find_rule(self, target: DynamicNode) -> CreationRule:
         ident = target.get_id()
         if not ident in self.rules.keys():
             raise RuntimeError(f"There is no rule for creating the dynamic node '{ident}'")
@@ -463,7 +470,7 @@ class BuildSystem:
 
         preorder_action(target)
         if isinstance(target, DynamicNode):
-            rule: Rule = self._find_rule(target)
+            rule: CreationRule = self._find_rule(target)
             for dep in rule.depends_on:
                 dep_id: str = dep.get_id()
                 if dep_id in node_stack:
@@ -482,7 +489,7 @@ class BuildSystem:
             if ident in target_stack:
                 raise RuntimeError(f"Found a circular dependency chain: " + ', '.join(target_stack + [ident]))
             
-            rule: Rule = self._find_rule(target)
+            rule: CreationRule = self._find_rule(target)
             
             # Ensure all dependencies are up to date:
             for dep in rule.depends_on:
